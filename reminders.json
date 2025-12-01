@@ -1,0 +1,12 @@
+[
+    {
+        "user": "Alice",
+        "message": "Finish math homework",
+        "timestamp": "2025-11-30 18:51:04"
+    },
+    {
+        "user": "Bob",
+        "message": "Prepare for science quiz",
+        "timestamp": "2025-11-30 18:51:04"
+    }
+]
