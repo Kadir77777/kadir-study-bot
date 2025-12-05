@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 import sqlite3
 
 
-
 # Configure logging to console and file
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
