@@ -4,6 +4,9 @@ import os
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+import sqlite3
+
+
 
 # Configure logging to console and file
 os.makedirs('logs', exist_ok=True)
@@ -64,7 +67,6 @@ async def helpme(ctx):
     )
     await ctx.send(help_text)
 
-import sqlite3
 os.makedirs('data', exist_ok=True)
 conn = sqlite3.connect('data/bot.db')
 cursor = conn.cursor()
@@ -102,6 +104,8 @@ async def listreminders(ctx):
 async def admin(ctx):
     logging.info("Admin command triggered")
     await ctx.send('Admin command executed.')
+
+@bot.command(name='')
 
 @admin.error
 async def admin_error(ctx, error):
