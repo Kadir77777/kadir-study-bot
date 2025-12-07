@@ -1,4 +1,18 @@
+# Project dependencies for StudyBuddy Bot
+# Pin versions if your instructor prefers reproducibility. These ranges are safe for discord.py 2.x.
+# If you know exact versions from your environment, replace the version specifiers accordingly.
 
-discord.py
-python-dotenv
-requests
+# Core Discord library (2.x)
+discord.py>=2.3,<3.0
+
+# Environment variables (.env)
+python-dotenv>=1.0,<2.0
+
+# HTTP requests for quotes API
+requests>=2.31,<3.0
+
+# (Optional) Voice features. Not required for this project; install only if you add voice.
+# PyNaCl>=1.5,<2.0
+
+# SQLite is built into Python's standard library (sqlite3), no install needed.
+# If you later use a migration tool or ORM (e.g., SQLAlchemy), add it here.
