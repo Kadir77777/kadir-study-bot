@@ -6,10 +6,12 @@ import asyncio
 import sqlite3
 from typing import Optional
 from datetime import datetime
+import datetime as dt
+import zoneinfo
 
 import requests
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from pathlib import Path
 
 from config import (
@@ -18,8 +20,9 @@ from config import (
     ZENQUOTES_URL, QUOTE_MAX_TRIES, QUOTE_BACKOFF_SECONDS, QUOTE_TIMEOUT_SECONDS,
     LOG_FILE, DB_PATH, FLASHCARDS_DIR, LOCAL_QUOTES_FILE
 )
-print("TOKEN FROM ENV:", DISCORD_TOKEN)
+
 # --- Sanity checks ---
+print("TOKEN FROM ENV:", DISCORD_TOKEN)
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing. Add it to your .env file.")
 
@@ -36,6 +39,10 @@ log = logging.getLogger("study-buddy-bot")
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # used by usercount
+
+# --- Timezone & reminder channel ---
+TZ = zoneinfo.ZoneInfo("America/New_York")
+REMINDER_CHANNEL_ID: Optional[int] = None  # set via !setreminderhere
 
 # --- Data folders ---
 os.makedirs("data", exist_ok=True)
@@ -76,6 +83,14 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Reminders (from File B, integrated)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                message TEXT NOT NULL
+            )
+        """)
         conn.commit()
         log.info("Database initialized")
     except Exception as e:
@@ -85,7 +100,7 @@ init_db()
 
 # --- Bot initialization ---
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
-bot.remove_command("help")  # FIX: allow custom help command
+bot.remove_command("help")  # allow custom help command
 
 # --- Admin notifications ---
 async def notify_admin(text: str):
@@ -125,6 +140,34 @@ def fetch_local_quote() -> Optional[dict]:
         log.error(f"Local quotes fallback failed: {fe}")
     return None
 
+# --- Daily reminder loop (from File B, integrated) ---
+@tasks.loop(time=dt.time(hour=9, minute=0, tzinfo=TZ))
+async def reminder_loop():
+    global REMINDER_CHANNEL_ID
+    if REMINDER_CHANNEL_ID is None:
+        return
+
+    channel = bot.get_channel(REMINDER_CHANNEL_ID)
+    if not channel:
+        log.warning("Reminder loop: channel not found.")
+        return
+
+    try:
+        cur.execute("SELECT user_id, message FROM reminders")
+        reminders = cur.fetchall()
+    except Exception as e:
+        log.error(f"Reminder loop DB error: {e}")
+        return
+
+    if not reminders:
+        return
+
+    for user_id, message in reminders:
+        try:
+            await channel.send(f"<@{user_id}> reminder: {message}")
+        except Exception as e:
+            log.warning(f"Failed to send reminder to {user_id}: {e}")
+
 # --- Lifecycle & error handling ---
 @bot.event
 async def on_ready():
@@ -135,6 +178,10 @@ async def on_ready():
             name=f"{COMMAND_PREFIX}help"
         )
     )
+    # Start the reminder loop if not running
+    if not reminder_loop.is_running():
+        log.info("Starting daily reminder loop")
+        reminder_loop.start()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -176,9 +223,17 @@ async def help_cmd(ctx):
         f"{COMMAND_PREFIX}pomodoro <minutes>  |  {COMMAND_PREFIX}stop\n"
         f"{COMMAND_PREFIX}progress — Show study stats\n"
         f"{COMMAND_PREFIX}quiz <topic> — Flashcard quiz (e.g., default)\n"
+        f"{COMMAND_PREFIX}setreminderhere — Set this channel for daily reminders\n"
+        f"{COMMAND_PREFIX}remind <message> — Save a daily reminder\n"
+        f"{COMMAND_PREFIX}listreminders — List your reminders\n"
+        f"{COMMAND_PREFIX}deletereminder <exact text> — Delete a reminder\n"
         f"{COMMAND_PREFIX}admin — Admin-only command\n"
         f"{COMMAND_PREFIX}ping  |  {COMMAND_PREFIX}usercount\n"
     )
+
+@bot.command(name="helpme", help="Alias for help.")
+async def helpme(ctx):
+    await help_cmd(ctx)
 
 @bot.command(name="ping", help="Health check. Replies with Pong and latency.")
 async def ping(ctx):
@@ -207,6 +262,11 @@ async def usercount(ctx):
 @commands.has_permissions(administrator=True)
 async def admin(ctx):
     await ctx.send("🔐 Admin command executed.")
+
+@admin.error
+async def admin_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("🔒 You do not have permission to use this command.")
 
 # ----- Assignment Tracker (!due) -----
 @bot.command(name="due", help="Assignment tracker. Use: !due add <title> <YYYY-MM-DD> | !due list | !due next | !due delete <id>")
@@ -366,6 +426,61 @@ async def quiz(ctx, topic: str = "default"):
         else:
             await ctx.send(f"❌ Wrong. Answer: {q['answer']}")
     await ctx.send(f"Quiz complete! Your Score: {score}/{total}")
+
+# reminder functions - ZM
+@bot.command(name="setreminderhere")
+async def setreminderhere(ctx):
+    global REMINDER_CHANNEL_ID
+    REMINDER_CHANNEL_ID = ctx.channel.id
+    log.info(f"Reminder channel set to {REMINDER_CHANNEL_ID} by {ctx.author}")
+    await ctx.send("Daily reminders will now be sent in this channel.")
+
+@bot.command(name="remind")
+async def remind(ctx, *, message: str):
+    try:
+        cur.execute(
+            "INSERT INTO reminders (user_id, message) VALUES (?, ?)",
+            (str(ctx.author.id), message)
+        )
+        conn.commit()
+        await ctx.send(f"Reminder saved: {message}")
+    except Exception as e:
+        log.error(f"Remind command error: {e}")
+        await ctx.send("Failed to save your reminder.")
+        await notify_admin(f"Remind error for {ctx.author}: {e}")
+
+@bot.command(name="listreminders")
+async def listreminders(ctx):
+    try:
+        cur.execute("SELECT message FROM reminders WHERE user_id = ?", (str(ctx.author.id),))
+        reminders = cur.fetchall()
+        if reminders:
+            reminder_list = "\n".join([f"- {r[0]}" for r in reminders])
+            await ctx.send(f"Your reminders:\n{reminder_list}")
+        else:
+            await ctx.send("You have no reminders.")
+    except Exception as e:
+        log.error(f"ListReminders command error: {e}")
+        await ctx.send("Failed to fetch your reminders.")
+        await notify_admin(f"ListReminders error for {ctx.author}: {e}")
+
+@bot.command(name="deletereminder", aliases=["dr"])
+async def deletereminder(ctx, *, reminder: str):
+    try:
+        cur.execute(
+            "DELETE FROM reminders WHERE user_id = ? AND message = ?",
+            (str(ctx.author.id), reminder)
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        if deleted == 0:
+            await ctx.send(f"No reminder named `{reminder}` found on your account.")
+        else:
+            await ctx.send(f"Deleted `{deleted}` reminder(s) named `{reminder}`.")
+    except Exception as e:
+        log.error(f"DeleteReminder command error: {e}")
+        await ctx.send("Failed to delete reminder(s).")
+        await notify_admin(f"DeleteReminder error for {ctx.author}: {e}")
 
 # --- Run the bot ---
 if __name__ == "__main__":
