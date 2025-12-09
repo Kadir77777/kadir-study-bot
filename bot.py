@@ -131,4 +131,223 @@ async def fetch_zenquote_async() -> Optional[dict]:
     return await _do_request()
 
 def fetch_local_quote() -> Optional[dict]:
-    tr
+    try:
+        with open(LOCAL_QUOTES_FILE, "r", encoding="utf-8") as f:
+            quotes = json.load(f)
+        if quotes:
+            q = random.choice(quotes)
+            return {"content": q, "author": "Local"}
+    except Exception:
+        return None
+
+# --- Daily Reminder Loop ---
+@tasks.loop(time=dt.time(hour=9, minute=0, tzinfo=TZ))
+async def reminder_loop():
+    global REMINDER_CHANNEL_ID
+    if REMINDER_CHANNEL_ID is None:
+        return
+    channel = bot.get_channel(REMINDER_CHANNEL_ID)
+    if not channel:
+        return
+
+    cur.execute("SELECT user_id, message FROM reminders")
+    reminders = cur.fetchall()
+
+    for user_id, message in reminders:
+        await channel.send(f"<@{user_id}> reminder: {message}")
+
+# --- Lifecycle ---
+@bot.event
+async def on_ready():
+    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f"{COMMAND_PREFIX}help"))
+
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send(f"🤖 Unknown command. Try `{COMMAND_PREFIX}help`.")
+        return
+    await ctx.send("❌ Error occurred.")
+    await notify_admin(f"Error: {error}")
+
+# ------------------ COMMANDS ----------------------
+
+# --- HELP ---
+@bot.command(name="help")
+async def help_cmd(ctx):
+    await ctx.send(
+        "**Commands & Usage:**\n"
+        f"{COMMAND_PREFIX}quote\n"
+        f"{COMMAND_PREFIX}due add <title> <YYYY-MM-DD>\n"
+        f"{COMMAND_PREFIX}pomodoro <minutes> | stop\n"
+        f"{COMMAND_PREFIX}progress\n"
+        f"{COMMAND_PREFIX}leaderboard ← NEW FEATURE\n"
+        f"{COMMAND_PREFIX}quiz <topic>\n"
+        f"{COMMAND_PREFIX}setreminderhere | remind | listreminders | deletereminder\n"
+        f"{COMMAND_PREFIX}ping | usercount\n"
+    )
+
+# --- Ping ---
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f"Pong! {round(bot.latency*1000)} ms")
+
+# --- Quote ---
+@bot.command()
+async def quote(ctx):
+    q = await fetch_zenquote_async()
+    if not q:
+        q = fetch_local_quote()
+    if not q:
+        return await ctx.send("Error fetching quote.")
+    await ctx.send(f"{q['content']} — *{q['author']}*")
+
+# --- User Count ---
+@bot.command()
+async def usercount(ctx):
+    await ctx.send(f"Members: {ctx.guild.member_count}")
+
+# --- Admin ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def admin(ctx):
+    await ctx.send("Admin command executed.")
+
+# --- DUE COMMAND ---
+@bot.command()
+async def due(ctx, sub=None, *args):
+    uid = str(ctx.author.id)
+
+    if sub == "add":
+        title = " ".join(args[:-1])
+        date = args[-1]
+        cur.execute("INSERT INTO assignments (user_id, title, due_date) VALUES (?, ?, ?)", (uid, title, date))
+        conn.commit()
+        return await ctx.send(f"Added: {title} due {date}")
+
+    cur.execute("SELECT id, title, due_date FROM assignments WHERE user_id=?", (uid,))
+    rows = cur.fetchall()
+    msg = "\n".join([f"{r[0]} — {r[1]} ({r[2]})" for r in rows])
+    await ctx.send("Your assignments:\n" + msg)
+
+# --- Pomodoro ---
+active_timers = {}
+
+@bot.command()
+async def pomodoro(ctx, minutes: int = 25):
+    uid = ctx.author.id
+    await ctx.send(f"Pomodoro started for {minutes} minutes!")
+
+    async def timer():
+        await asyncio.sleep(minutes*60)
+        cur.execute("INSERT INTO study_sessions (user_id, minutes, started_at) VALUES (?, ?, datetime('now'))", (str(uid), minutes))
+        conn.commit()
+        await ctx.send(f"{ctx.author.mention} Time's up!")
+
+    active_timers[uid] = asyncio.create_task(timer())
+
+@bot.command()
+async def stop(ctx):
+    uid = ctx.author.id
+    task = active_timers.get(uid)
+    if task:
+        task.cancel()
+        await ctx.send("Timer stopped.")
+
+# --- Progress ---
+@bot.command()
+async def progress(ctx):
+    uid = str(ctx.author.id)
+    cur.execute("SELECT COUNT(*), SUM(minutes) FROM study_sessions WHERE user_id=?", (uid,))
+    count, total = cur.fetchone()
+    total = total or 0
+    await ctx.send(f"Sessions: {count}, Total minutes: {total}")
+
+# ---------------------------------------------------
+# NEW FEATURE FOR MODULE 10 — LEADERBOARD
+# ---------------------------------------------------
+
+@bot.command(name="leaderboard", help="Show top study times leaderboard.")
+async def leaderboard(ctx):
+    try:
+        cur.execute("""
+            SELECT user_id, SUM(minutes) AS total_minutes
+            FROM study_sessions
+            GROUP BY user_id
+            ORDER BY total_minutes DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+
+        if not rows:
+            return await ctx.send("📊 No study data yet — start a pomodoro session using `!pomodoro <minutes>`.")        
+
+        lines = []
+        rank = 1
+        for uid, minutes in rows:
+            user = await bot.fetch_user(int(uid))
+            name = user.name if user else f"User {uid}"
+            lines.append(f"**#{rank}** — {name}: `{minutes}` minutes")
+            rank += 1
+
+        await ctx.send("🏆 **Study Leaderboard**\n" + "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"Leaderboard error: {e}")
+        await ctx.send("❌ Couldn't load leaderboard.")
+
+# --- Quiz ---
+@bot.command()
+async def quiz(ctx, topic="default"):
+    qfile = os.path.join(FLASHCARDS_DIR, f"{topic}.json")
+    try:
+        with open(qfile, "r") as f:
+            questions = json.load(f)
+    except:
+        return await ctx.send("No quiz found.")
+
+    random.shuffle(questions)
+    score = 0
+    for q in questions[:5]:
+        await ctx.send(q["question"])
+        msg = await bot.wait_for("message", check=lambda m: m.author == ctx.author, timeout=20)
+        if msg.content.lower() == q["answer"].lower():
+            score += 1
+            await ctx.send("Correct!")
+        else:
+            await ctx.send(f"Wrong — {q['answer']}")
+    await ctx.send(f"Score: {score}/5")
+
+# --- Reminder Commands ---
+@bot.command()
+async def setreminderhere(ctx):
+    global REMINDER_CHANNEL_ID
+    REMINDER_CHANNEL_ID = ctx.channel.id
+    await ctx.send("Daily reminders will be sent here.")
+
+@bot.command()
+async def remind(ctx, *, message):
+    cur.execute("INSERT INTO reminders (user_id, message) VALUES (?, ?)", (str(ctx.author.id), message))
+    conn.commit()
+    await ctx.send("Reminder saved!")
+
+@bot.command()
+async def listreminders(ctx):
+    cur.execute("SELECT message FROM reminders WHERE user_id=?", (str(ctx.author.id),))
+    rows = cur.fetchall()
+    if not rows:
+        return await ctx.send("You have no reminders.")
+    await ctx.send("\n".join([f"- {r[0]}" for r in rows]))
+
+@bot.command()
+async def deletereminder(ctx, *, message):
+    cur.execute("DELETE FROM reminders WHERE user_id=? AND message=?", (str(ctx.author.id), message))
+    conn.commit()
+    await ctx.send("Reminder deleted (if it existed).")
+
+# --- Run Bot ---
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
